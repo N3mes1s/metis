@@ -20,6 +20,7 @@ from metis.exceptions import (
 from metis.vector_store.base import BaseVectorStore
 from metis.plugin_loader import load_plugins, discover_supported_language_names
 from metis.utils import (
+    count_tokens,
     read_file_content,
 )
 
@@ -296,14 +297,17 @@ class MetisEngine:
         # Clear pending nodes
         self._pending_nodes = None
 
-    def review_file(self, file_path):
+    def review_file(self, file_path, skip_retrieval=False):
         """
         Review a single source file. Detects plugin by extension, retrieves
         relevant context from code/docs indexes, runs the security review,
         and returns a result dict or None
         if the file is unsupported or empty.
         """
-        qe_code, qe_docs = self._init_and_get_query_engines()
+        if skip_retrieval:
+            qe_code, qe_docs = None, None
+        else:
+            qe_code, qe_docs = self._init_and_get_query_engines()
         base_path = os.path.abspath(self.codebase_path)
         snippet = read_file_content(file_path)
         if not snippet:
@@ -333,6 +337,7 @@ class MetisEngine:
                 "default_prompt_key": "security_review_file",
                 "relative_file": relative_path,
                 "mode": "file",
+                "skip_retrieval": skip_retrieval,
             }
             return self._get_review_graph().review(req)
         except Exception as e:
@@ -377,13 +382,14 @@ class MetisEngine:
         """
         Iterate all supported code files under `codebase_path` and yield
         per-file review results. Uses a thread pool and continues on errors.
+        Skips vector retrieval since we're reviewing the entire codebase.
         """
         files = self.get_code_files()
         if not files:
             return
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_path = {
-                executor.submit(self.review_file, path): path for path in files
+                executor.submit(self.review_file, path, True): path for path in files
             }
             for future in as_completed(future_to_path):
                 path = future_to_path[future]
@@ -397,6 +403,122 @@ class MetisEngine:
                     yield result
                 else:
                     yield None
+
+    def review_code_batched(self, batch_token_target=8000):
+        """
+        Review all code files, batching small files into single LLM calls.
+        Yields per-file result dicts as they complete.
+        Files exceeding batch_token_target are reviewed individually.
+        Falls back to single-file review on batch parse failure.
+        """
+        files = self.get_code_files()
+        if not files:
+            return
+
+        base_path = os.path.abspath(self.codebase_path)
+        review_graph = self._get_review_graph()
+
+        # Read and measure all files, group by plugin
+        file_entries = []
+        for path in files:
+            snippet = read_file_content(path)
+            if not snippet:
+                yield None
+                continue
+            ext = os.path.splitext(path)[1].lower()
+            plugin = self._get_plugin_for_extension(ext)
+            if not plugin:
+                yield None
+                continue
+            tokens = count_tokens(snippet)
+            relative_path = os.path.relpath(path, base_path)
+            file_entries.append({
+                "file_path": path,
+                "relative_file": relative_path,
+                "snippet": snippet,
+                "tokens": tokens,
+                "plugin": plugin,
+            })
+
+        # Separate large files (review individually) from small files (batch)
+        large_files = [e for e in file_entries if e["tokens"] > batch_token_target]
+        small_files = [e for e in file_entries if e["tokens"] <= batch_token_target]
+
+        # Group small files into batches by plugin
+        batches = []
+        # Group by plugin name for consistent language_prompts
+        by_plugin = {}
+        for entry in small_files:
+            key = entry["plugin"].get_name()
+            by_plugin.setdefault(key, []).append(entry)
+
+        for plugin_name, entries in by_plugin.items():
+            current_batch = []
+            current_tokens = 0
+            for entry in entries:
+                if current_tokens + entry["tokens"] > batch_token_target and current_batch:
+                    batches.append(current_batch)
+                    current_batch = []
+                    current_tokens = 0
+                current_batch.append(entry)
+                current_tokens += entry["tokens"]
+            if current_batch:
+                batches.append(current_batch)
+
+        def _run_batch(batch):
+            plugin = batch[0]["plugin"]
+            language_prompts = plugin.get_prompts()
+            try:
+                results = review_graph.review_batch(batch, language_prompts)
+                if results is not None:
+                    return results
+            except Exception as e:
+                logger.warning("Batch review failed, falling back to single-file: %s", e)
+            # Fallback: review each file individually
+            fallback_results = []
+            for entry in batch:
+                try:
+                    result = self.review_file(entry["file_path"], skip_retrieval=True)
+                    fallback_results.append(result)
+                except Exception as e2:
+                    logger.error("Single-file fallback failed for %s: %s", entry["file_path"], e2)
+                    fallback_results.append(None)
+            return fallback_results
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit batches and large single files
+            future_to_work = {}
+            for batch in batches:
+                f = executor.submit(_run_batch, batch)
+                future_to_work[f] = ("batch", batch)
+            for entry in large_files:
+                f = executor.submit(self.review_file, entry["file_path"], True)
+                future_to_work[f] = ("single", entry)
+
+            for future in as_completed(future_to_work):
+                work_type, work_data = future_to_work[future]
+                try:
+                    result = future.result()
+                except Exception as e:
+                    if work_type == "batch":
+                        logger.error("Batch review error: %s", e)
+                        for _ in work_data:
+                            yield None
+                    else:
+                        logger.error("File review error for %s: %s", work_data["file_path"], e)
+                        yield None
+                    continue
+
+                if work_type == "batch":
+                    # result is a list of per-file dicts
+                    if result:
+                        for r in result:
+                            yield r
+                    else:
+                        for _ in work_data:
+                            yield None
+                else:
+                    yield result if result else None
 
     def review_patch(self, patch_file):
         """

@@ -269,6 +269,69 @@ def save_output(output_files, data, quiet=False):
         _write_payload(output_path, json_payload, "Results")
 
 
+class IncrementalJsonWriter:
+    """
+    Writes per-file review results incrementally as JSONL to a .tmp file.
+    On finalize(), produces the final JSON output atomically.
+    """
+
+    def __init__(self, output_path):
+        self.output_path = Path(output_path)
+        self.tmp_path = self.output_path.with_suffix(self.output_path.suffix + "l.tmp")
+        self.tmp_path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = open(self.tmp_path, "w", encoding="utf-8")
+        self._count = 0
+
+    def write_result(self, result):
+        """Write a single file review result as a JSONL line."""
+        if result is not None:
+            self._file.write(json.dumps(result) + "\n")
+            self._file.flush()
+            self._count += 1
+
+    def finalize(self):
+        """Close tmp file and write final JSON atomically."""
+        self._file.close()
+        # Read back all results
+        reviews = []
+        if self.tmp_path.exists():
+            with open(self.tmp_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            reviews.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            pass
+        # Write final JSON atomically via tmp
+        final_tmp = self.output_path.with_suffix(self.output_path.suffix + ".writing")
+        with open(final_tmp, "w", encoding="utf-8") as f:
+            json.dump({"reviews": reviews}, f, indent=4)
+        final_tmp.rename(self.output_path)
+        # Clean up JSONL tmp
+        try:
+            self.tmp_path.unlink()
+        except OSError:
+            pass
+        return {"reviews": reviews}
+
+    @staticmethod
+    def load_partial(output_path):
+        """Load partial results from a .jsonl.tmp file (crash recovery)."""
+        tmp_path = Path(output_path).with_suffix(Path(output_path).suffix + "l.tmp")
+        reviews = []
+        if tmp_path.exists():
+            with open(tmp_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            reviews.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            pass
+        return {"reviews": reviews}
+
+
 def check_file_exists(file_path, quiet=False):
     if not Path(file_path).is_file():
         print_console(f"[red]File not found:[/red] {escape(file_path)}", quiet)

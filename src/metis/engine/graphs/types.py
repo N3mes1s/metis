@@ -20,6 +20,8 @@ class ReviewRequest(TypedDict):
     mode: NotRequired[str]
     # Optional original file contents for patch mode
     original_file: NotRequired[Optional[str]]
+    # Skip vector retrieval (used in full-codebase review_code)
+    skip_retrieval: NotRequired[bool]
 
 
 class AskRequest(TypedDict):
@@ -39,10 +41,21 @@ class ReviewState(TypedDict, total=False):
     relative_file: Optional[str]
     mode: str
     original_file: Optional[str]
+    skip_retrieval: bool
     # Derived
     context: str
     system_prompt: str
     parsed_reviews: list[dict]
+
+
+class BatchReviewState(TypedDict, total=False):
+    # Input
+    file_paths: list[str]
+    batch_body: str
+    language_prompts: dict
+    # Derived
+    system_prompt: str
+    parsed_results: list[dict]
 
 
 class AskState(TypedDict, total=False):

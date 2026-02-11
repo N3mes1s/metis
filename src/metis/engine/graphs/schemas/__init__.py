@@ -4,6 +4,8 @@
 from .review import (
     ReviewIssueModel,
     ReviewResponseModel,
+    BatchFileReviewModel,
+    BatchReviewResponseModel,
     review_schema_json,
     review_schema_prompt,
 )
@@ -11,6 +13,8 @@ from .review import (
 __all__ = [
     "ReviewIssueModel",
     "ReviewResponseModel",
+    "BatchFileReviewModel",
+    "BatchReviewResponseModel",
     "review_schema_json",
     "review_schema_prompt",
 ]

@@ -17,6 +17,7 @@ from .utils import (
     pretty_print_reviews,
     save_output,
     print_console,
+    IncrementalJsonWriter,
 )
 
 
@@ -89,15 +90,46 @@ def run_file_review(engine, file_path, args):
 
 
 def run_review_code(engine, args):
+    total = len(engine.get_code_files())
+    if total == 0:
+        print_console("[green]No code files found to review.[/green]", args.quiet)
+        return
+
+    # Determine primary JSON output for incremental writing
+    output_files = args.output_file
+    json_output = None
+    if isinstance(output_files, str):
+        json_output = output_files
+    elif isinstance(output_files, (list, tuple)):
+        for f in output_files:
+            if str(f).endswith(".json"):
+                json_output = str(f)
+                break
+        if json_output is None and output_files:
+            json_output = str(output_files[0])
+
+    writer = IncrementalJsonWriter(json_output) if json_output else None
+
+    def _batched_generator():
+        for result in engine.review_code_batched():
+            if writer:
+                writer.write_result(result)
+            yield result
+
     if args.verbose:
-        print_console("[cyan]Reviewing codebase...[/cyan]", args.quiet)
-        total = len(engine.get_code_files())
-        file_reviews = iterate_with_progress(total, engine.review_code())
+        print_console("[cyan]Reviewing codebase (batched)...[/cyan]", args.quiet)
+        file_reviews = iterate_with_progress(total, _batched_generator())
         results = {"reviews": file_reviews}
     else:
         results = with_spinner(
-            "Reviewing codebase...", collect_reviews, engine, quiet=args.quiet
+            "Reviewing codebase...",
+            lambda: {"reviews": [r for r in _batched_generator() if r]},
+            quiet=args.quiet,
         )
+
+    if writer:
+        results = writer.finalize()
+
     pretty_print_reviews(results, args.quiet)
     save_output(args.output_file, results, args.quiet)
 
