@@ -65,6 +65,8 @@ def load_runtime_config(config_path=None, enable_psql=False):
             )
         runtime["llm_api_key"] = llm_api_key
         runtime["model"] = llm_cfg.get("model", "")
+        if llm_cfg.get("use_responses_api") is not None:
+            runtime["use_responses_api"] = llm_cfg["use_responses_api"]
     elif llm_provider_name == "azure_openai":
         llm_api_key = os.environ.get("AZURE_OPENAI_API_KEY")
         if not llm_api_key:
@@ -96,6 +98,8 @@ def load_runtime_config(config_path=None, enable_psql=False):
         runtime["openai_api_base"] = llm_cfg.get("base_url", "")
         runtime["openai_default_headers"] = llm_cfg.get("default_headers", {})
         runtime["model"] = llm_cfg.get("model", "")
+        if llm_cfg.get("use_responses_api") is not None:
+            runtime["use_responses_api"] = llm_cfg["use_responses_api"]
     elif llm_provider_name == "ollama":
         runtime["llm_api_key"] = llm_cfg.get("api_key") or ""
         api_key_env = llm_cfg.get("api_key_env")
@@ -106,6 +110,8 @@ def load_runtime_config(config_path=None, enable_psql=False):
         )
         runtime["openai_default_headers"] = llm_cfg.get("default_headers", {})
         runtime["model"] = llm_cfg.get("model", "")
+        if llm_cfg.get("use_responses_api") is not None:
+            runtime["use_responses_api"] = llm_cfg["use_responses_api"]
         runtime["force_openai_like"] = True
     else:
         raise ValueError(f"Unsupported LLM provider: {llm_provider_name}")

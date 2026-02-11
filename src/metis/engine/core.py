@@ -25,6 +25,7 @@ from metis.utils import (
 )
 
 from .helpers import (
+    build_summary_chain,
     summarize_changes,
     prepare_nodes_iter,
     apply_custom_guidance,
@@ -36,6 +37,9 @@ from metis.engine.graphs import ReviewGraph, AskGraph
 
 
 logger = logging.getLogger("metis")
+
+# Sentinel used to distinguish "cache populated with None" from "not yet cached".
+_METISIGNORE_MISS = object()
 
 
 class MetisEngine:
@@ -100,23 +104,28 @@ class MetisEngine:
     def load_metisignore(self) -> pathspec.GitIgnoreSpec | None:
         """
         Load metisignore file and return a GitIgnoreSpec matcher.
-
-        Args:
-            metisignore: Path to a file that have the ignore regex ( use the .gitignore syntax )
+        The result is cached for the lifetime of this engine instance.
 
         Returns:
             pathspec.GitIgnoreSpec object or None if file doesn't exist
         """
+        cached = getattr(self, "_metisignore_cache", None)
+        if cached is not None:
+            return cached if cached is not _METISIGNORE_MISS else None
+
         try:
             if not self.metisignore_file:
                 logger.info("No MetisIgnore file provided")
+                self._metisignore_cache = _METISIGNORE_MISS
                 return None
             with open(self.metisignore_file, "r") as f:
                 spec = pathspec.GitIgnoreSpec.from_lines(f)
                 logger.info(f"MetisIgnore file loaded: {self.metisignore_file}")
+            self._metisignore_cache = spec
             return spec
         except FileNotFoundError:
             logger.info(f"MetisIgnore file not loaded {self.metisignore_file}")
+            self._metisignore_cache = _METISIGNORE_MISS
             return None
 
     def _get_review_graph(self):
@@ -404,41 +413,47 @@ class MetisEngine:
                 else:
                     yield None
 
-    def review_code_batched(self, batch_token_target=8000):
+    def review_code_batched(self, batch_token_target=30000, files=None):
         """
         Review all code files, batching small files into single LLM calls.
         Yields per-file result dicts as they complete.
         Files exceeding batch_token_target are reviewed individually.
         Falls back to single-file review on batch parse failure.
+
+        If *files* is provided it is used directly, skipping ``get_code_files()``.
         """
-        files = self.get_code_files()
+        if files is None:
+            files = self.get_code_files()
         if not files:
             return
 
         base_path = os.path.abspath(self.codebase_path)
         review_graph = self._get_review_graph()
 
-        # Read and measure all files, group by plugin
-        file_entries = []
-        for path in files:
+        # Read all files in parallel and measure tokens.
+        def _read_and_measure(path):
             snippet = read_file_content(path)
             if not snippet:
-                yield None
-                continue
+                return None
             ext = os.path.splitext(path)[1].lower()
             plugin = self._get_plugin_for_extension(ext)
             if not plugin:
-                yield None
-                continue
-            tokens = count_tokens(snippet)
-            relative_path = os.path.relpath(path, base_path)
-            file_entries.append({
+                return None
+            return {
                 "file_path": path,
-                "relative_file": relative_path,
+                "relative_file": os.path.relpath(path, base_path),
                 "snippet": snippet,
-                "tokens": tokens,
+                "tokens": count_tokens(snippet),
                 "plugin": plugin,
-            })
+            }
+
+        file_entries = []
+        with ThreadPoolExecutor(max_workers=self.max_workers) as io_pool:
+            for entry in io_pool.map(_read_and_measure, files):
+                if entry is None:
+                    yield None
+                else:
+                    file_entries.append(entry)
 
         # Separate large files (review individually) from small files (batch)
         large_files = [e for e in file_entries if e["tokens"] > batch_token_target]
@@ -474,11 +489,23 @@ class MetisEngine:
                     return results
             except Exception as e:
                 logger.warning("Batch review failed, falling back to single-file: %s", e)
-            # Fallback: review each file individually
+            # Fallback: review each file individually using already-read snippets.
             fallback_results = []
             for entry in batch:
                 try:
-                    result = self.review_file(entry["file_path"], skip_retrieval=True)
+                    req: ReviewRequest = {
+                        "file_path": entry["file_path"],
+                        "snippet": entry["snippet"],
+                        "retriever_code": None,
+                        "retriever_docs": None,
+                        "context_prompt": "",
+                        "language_prompts": language_prompts,
+                        "default_prompt_key": "security_review_file",
+                        "relative_file": entry["relative_file"],
+                        "mode": "file",
+                        "skip_retrieval": True,
+                    }
+                    result = review_graph.review(req)
                     fallback_results.append(result)
                 except Exception as e2:
                     logger.error("Single-file fallback failed for %s: %s", entry["file_path"], e2)
@@ -532,10 +559,15 @@ class MetisEngine:
         except Exception as e:
             logger.error(f"Error parsing patch file: {e}")
             return {"reviews": [], "overall_changes": ""}
-        file_reviews = []
-        overall_summaries = []
         base_path = os.path.abspath(self.codebase_path)
         metisignore_spec = self.load_metisignore()
+        context_prompt_tmpl = self.plugin_config.get("general_prompts", {}).get(
+            "retrieve_context", ""
+        )
+        summary_chain = build_summary_chain(self.llm_provider)
+
+        # Collect reviewable diffs (lightweight filtering before thread pool).
+        work_items = []
         for file_diff in diff:
             if file_diff.is_removed_file or file_diff.is_binary_file:
                 continue
@@ -551,19 +583,20 @@ class MetisEngine:
             plugin = self._get_plugin_for_extension(ext)
             if not plugin:
                 continue
+            original_content = read_file_content(abs_path)
             snippet = process_diff_file(
-                self.codebase_path, file_diff, self.max_token_length
+                self.codebase_path, file_diff, self.max_token_length,
+                original_content=original_content,
             )
             if not snippet:
                 continue
-            context_prompt = self.plugin_config.get("general_prompts", {}).get(
-                "retrieve_context", ""
-            )
-            formatted_context = context_prompt.format(file_path=file_diff.path)
+            work_items.append((file_diff, abs_path, relative_path, plugin, snippet, original_content))
 
+        def _review_one(item):
+            file_diff, abs_path, relative_path, plugin, snippet, original_content = item
+            formatted_context = context_prompt_tmpl.format(file_path=file_diff.path)
             language_prompts = plugin.get_prompts()
             try:
-                original_content = read_file_content(abs_path)
                 req: ReviewRequest = {
                     "file_path": abs_path,
                     "snippet": snippet,
@@ -579,23 +612,34 @@ class MetisEngine:
                 review_dict = self._get_review_graph().review(req)
             except Exception as e:
                 logger.error(f"Error processing review for {file_diff.path}: {e}")
-                review_dict = None
-            if review_dict:
-                file_reviews.append(review_dict)
-                issues = "\n".join(
-                    issue.get("issue", "") for issue in review_dict.get("reviews", [])
-                )
-                summary_prompt = language_prompts["snippet_security_summary"]
-                summary_prompt = apply_custom_guidance(
-                    summary_prompt,
-                    self.custom_prompt_text,
-                    self.custom_guidance_precedence,
-                )
-                changes_summary = summarize_changes(
-                    self.llm_provider, file_diff.path, issues, summary_prompt
-                )
+                return None, None
+
+            if not review_dict:
+                return None, None
+
+            issues = "\n".join(
+                issue.get("issue", "") for issue in review_dict.get("reviews", [])
+            )
+            summary_prompt = apply_custom_guidance(
+                language_prompts["snippet_security_summary"],
+                self.custom_prompt_text,
+                self.custom_guidance_precedence,
+            )
+            changes_summary = summarize_changes(
+                self.llm_provider, file_diff.path, issues, summary_prompt,
+                chain=summary_chain,
+            )
+            return review_dict, changes_summary
+
+        file_reviews = []
+        overall_summaries = []
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            for review_dict, changes_summary in executor.map(_review_one, work_items):
+                if review_dict:
+                    file_reviews.append(review_dict)
                 if changes_summary:
                     overall_summaries.append(changes_summary)
+
         overall_changes = "\n\n".join(overall_summaries)
         return {"reviews": file_reviews, "overall_changes": overall_changes}
 

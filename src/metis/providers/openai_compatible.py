@@ -22,6 +22,11 @@ from metis.providers.base import LLMProvider
 _ALLOWED_OPENAI_EMBED_MODELS = {member.value for member in OpenAIEmbeddingModelType}
 
 
+# Models that only support the OpenAI Responses API (not Chat Completions).
+# Update this set as OpenAI adds new Responses-only models.
+_RESPONSES_ONLY_MODELS = {"gpt-5.2-codex", "gpt-5.3-codex"}
+
+
 class OpenAICompatibleProvider(LLMProvider):
 
     def __init__(self, config: Dict[str, Any]):
@@ -45,6 +50,7 @@ class OpenAICompatibleProvider(LLMProvider):
         self.docs_embedding_model = config.get("docs_embedding_model")
         self.code_embedding_extra_kwargs = config.get("code_embedding_extra_kwargs", {})
         self.docs_embedding_extra_kwargs = config.get("docs_embedding_extra_kwargs", {})
+        self.use_responses_api = config.get("use_responses_api")
 
     def get_embed_model_code(self):
         return self._build_embedding_model(
@@ -91,6 +97,12 @@ class OpenAICompatibleProvider(LLMProvider):
             embed.model_name = model_name
         return embed
 
+    def _needs_responses_api(self, model_name: str) -> bool:
+        """Check if this model requires the Responses API."""
+        if self.use_responses_api is not None:
+            return bool(self.use_responses_api)
+        return model_name in _RESPONSES_ONLY_MODELS
+
     def get_chat_model(self, model: str | None = None, **kwargs):
         model_name = model or self.query_model
         if not model_name:
@@ -101,6 +113,9 @@ class OpenAICompatibleProvider(LLMProvider):
             "temperature": kwargs.get("temperature", self.temperature),
             "max_tokens": kwargs.get("max_tokens", self.max_tokens),
         }
+
+        if self._needs_responses_api(model_name):
+            params["use_responses_api"] = True
 
         if self.api_key:
             params["api_key"] = self.api_key

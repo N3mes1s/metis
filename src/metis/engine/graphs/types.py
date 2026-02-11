@@ -48,16 +48,6 @@ class ReviewState(TypedDict, total=False):
     parsed_reviews: list[dict]
 
 
-class BatchReviewState(TypedDict, total=False):
-    # Input
-    file_paths: list[str]
-    batch_body: str
-    language_prompts: dict
-    # Derived
-    system_prompt: str
-    parsed_results: list[dict]
-
-
 class AskState(TypedDict, total=False):
     # Input
     question: str

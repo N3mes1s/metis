@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import threading
 from functools import partial
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -21,6 +22,21 @@ from .types import ReviewRequest, ReviewState
 
 
 logger = logging.getLogger("metis")
+
+
+def _bind_structured_output(chat_model, response_model):
+    """Try binding structured output via function_calling, then json_schema.
+
+    Returns the bound model or ``None`` if neither method succeeds.
+    """
+    for method in ("function_calling", "json_schema"):
+        try:
+            bound = chat_model.with_structured_output(response_model, method=method)
+            logger.info("Structured output bound with method=%s", method)
+            return bound
+        except Exception as exc:
+            logger.warning("Structured output method=%s failed: %s", method, exc)
+    return None
 
 
 def _normalize_reviews(raw) -> list[dict]:
@@ -207,6 +223,12 @@ class ReviewGraph:
                 "Unable to create review runnable; OpenAI-based provider required."
             )
         self._app_cache = {}
+        self._app_cache_lock = threading.Lock()
+        # Lazily built batch runnables (created on first review_batch call)
+        self._batch_structured_node = None
+        self._batch_fallback_node = None
+        self._batch_runnables_ready = False
+        self._batch_init_lock = threading.Lock()
 
     def _create_structured_review_runnable(self):
         get_chat_model = getattr(self.llm_provider, "get_chat_model", None)
@@ -223,16 +245,30 @@ class ReviewGraph:
             [("system", "{system_prompt}"), ("user", "{body_text}")]
         )
         self._fallback_review_node = prompt | chat_model | StrOutputParser()
+
+        structured_model = _bind_structured_output(chat_model, ReviewResponseModel)
+        if structured_model is not None:
+            return prompt | structured_model
+        return None
+
+    def _init_batch_runnables(self):
+        """Build and cache the batch-review runnables (once)."""
+        self._batch_runnables_ready = True
+        get_chat_model = getattr(self.llm_provider, "get_chat_model", None)
+        if not callable(get_chat_model):
+            return
         try:
-            structured_model = chat_model.with_structured_output(
-                ReviewResponseModel, method="function_calling"
-            )
+            chat_model = get_chat_model(model=self.llama_query_model)
         except Exception as exc:
-            logger.warning(
-                "Failed to bind structured output schema for review graph: %s", exc
-            )
-            return None
-        return prompt | structured_model
+            logger.warning("Unable to create chat model for batch review: %s", exc)
+            return
+        prompt = ChatPromptTemplate.from_messages(
+            [("system", "{system_prompt}"), ("user", "{body_text}")]
+        )
+        self._batch_fallback_node = prompt | chat_model | StrOutputParser()
+        structured_model = _bind_structured_output(chat_model, BatchReviewResponseModel)
+        if structured_model is not None:
+            self._batch_structured_node = prompt | structured_model
 
     def _build_app(self, language_prompts, default_prompt_key):
         cache_key = (id(language_prompts), default_prompt_key)
@@ -240,6 +276,14 @@ class ReviewGraph:
         if cached is not None:
             return cached
 
+        with self._app_cache_lock:
+            # Double-check after acquiring the lock.
+            cached = self._app_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            return self._compile_app(language_prompts, default_prompt_key, cache_key)
+
+    def _compile_app(self, language_prompts, default_prompt_key, cache_key):
         graph = StateGraph(ReviewState)
         retrieve = review_node_retrieve
         build_prompt = partial(
@@ -352,28 +396,26 @@ class ReviewGraph:
 
         payload = {"system_prompt": system_prompt, "body_text": batch_body}
 
+        # Lazily build & cache the batch runnables once.
+        if not self._batch_runnables_ready:
+            with self._batch_init_lock:
+                if not self._batch_runnables_ready:
+                    self._init_batch_runnables()
+
         # Try structured output first with BatchReviewResponseModel
         raw = None
         try:
-            get_chat_model = getattr(self.llm_provider, "get_chat_model", None)
-            if callable(get_chat_model):
-                chat_model = get_chat_model(model=self.llama_query_model)
-                prompt = ChatPromptTemplate.from_messages(
-                    [("system", "{system_prompt}"), ("user", "{body_text}")]
-                )
+            if self._batch_structured_node is not None:
                 try:
-                    structured = chat_model.with_structured_output(
-                        BatchReviewResponseModel, method="function_calling"
-                    )
-                    raw = (prompt | structured).invoke(payload)
+                    raw = self._batch_structured_node.invoke(payload)
                 except Exception as exc:
                     logger.warning("Batch structured output failed: %s", exc)
-                    # Fall back to unstructured + parse
-                    try:
-                        raw = (prompt | chat_model | StrOutputParser()).invoke(payload)
-                    except Exception as exc2:
-                        logger.error("Batch fallback also failed: %s", exc2)
-                        return None
+            if raw is None and self._batch_fallback_node is not None:
+                try:
+                    raw = self._batch_fallback_node.invoke(payload)
+                except Exception as exc2:
+                    logger.error("Batch fallback also failed: %s", exc2)
+                    return None
         except Exception as exc:
             logger.error("Batch review failed: %s", exc)
             return None

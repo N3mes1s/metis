@@ -90,7 +90,8 @@ def run_file_review(engine, file_path, args):
 
 
 def run_review_code(engine, args):
-    total = len(engine.get_code_files())
+    code_files = engine.get_code_files()
+    total = len(code_files)
     if total == 0:
         print_console("[green]No code files found to review.[/green]", args.quiet)
         return
@@ -111,7 +112,7 @@ def run_review_code(engine, args):
     writer = IncrementalJsonWriter(json_output) if json_output else None
 
     def _batched_generator():
-        for result in engine.review_code_batched():
+        for result in engine.review_code_batched(files=code_files):
             if writer:
                 writer.write_result(result)
             yield result

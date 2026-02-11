@@ -19,7 +19,7 @@ def extract_content_from_diff(file_diff):
     return "".join(content_lines)
 
 
-def process_diff_file(codebase_path, file_diff, max_token_length):
+def process_diff_file(codebase_path, file_diff, max_token_length, original_content=None):
     changed_lines = []
     for hunk in file_diff:
         for line in hunk:
@@ -28,8 +28,9 @@ def process_diff_file(codebase_path, file_diff, max_token_length):
             elif line.is_removed:
                 changed_lines.append("-" + line.value)
     snippet = "".join(changed_lines)
-    original_file_path = os.path.join(codebase_path, file_diff.path)
-    original_content = read_file_content(original_file_path)
+    if original_content is None:
+        original_file_path = os.path.join(codebase_path, file_diff.path)
+        original_content = read_file_content(original_file_path)
     if original_content:
         logger.info(f"Fetched original content for {file_diff.path}.")
         total_tokens = count_tokens(original_content) + count_tokens(snippet)
