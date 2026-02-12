@@ -10,6 +10,8 @@ import sys
 
 import tiktoken
 
+_WHITESPACE_RE = re.compile(r"\s+")
+
 
 def safe_decode_unicode(s):
     if isinstance(s, str):
@@ -17,28 +19,41 @@ def safe_decode_unicode(s):
     return s
 
 
+_encoding_cache: dict[str, tiktoken.Encoding] = {}
+
+
+def _get_encoding(model: str = "gpt-4") -> tiktoken.Encoding:
+    """Return a cached tiktoken encoder for *model*."""
+    enc = _encoding_cache.get(model)
+    if enc is None:
+        enc = tiktoken.encoding_for_model(model)
+        _encoding_cache[model] = enc
+    return enc
+
+
 def count_tokens(text, model="gpt-4"):
-    encoding = tiktoken.encoding_for_model(model)
-    return len(encoding.encode(text))
+    return len(_get_encoding(model).encode(text))
 
 
 def split_snippet(snippet, max_tokens, model="gpt-4"):
+    encoding = _get_encoding(model)
     lines = snippet.splitlines(keepends=True)
+    # Encode all lines in one batch to avoid per-line encoder overhead.
+    line_token_counts = [len(encoding.encode(line)) for line in lines]
+
     chunks = []
     current_chunk = ""
     current_token_count = 0
 
-    for line in lines:
-        line_token_count = count_tokens(line, model)
-        # If adding this line would exceed the limit, flush the current chunk.
-        if current_token_count + line_token_count > max_tokens:
+    for line, line_tokens in zip(lines, line_token_counts):
+        if current_token_count + line_tokens > max_tokens:
             if current_chunk:
                 chunks.append(current_chunk)
             current_chunk = line
-            current_token_count = line_token_count
+            current_token_count = line_tokens
         else:
             current_chunk += line
-            current_token_count += line_token_count
+            current_token_count += line_tokens
 
     if current_chunk:
         chunks.append(current_chunk)
@@ -133,7 +148,7 @@ def read_file_content(file_path):
 def normalize_lines(lines):
     """Remove all whitespace characters from the joined lines."""
     joined = "".join(lines)
-    return re.sub(r"\s+", "", joined)
+    return _WHITESPACE_RE.sub("", joined)
 
 
 def find_snippet_line(snippet, file_lines, threshold=0.80):
@@ -147,15 +162,24 @@ def find_snippet_line(snippet, file_lines, threshold=0.80):
 
     snippet_lines = snippet.strip().splitlines()
     snippet_len = len(snippet_lines)
+    if snippet_len == 0:
+        return 1
     norm_snippet = normalize_lines(snippet_lines)
+    if not norm_snippet:
+        return 1
 
-    for i in range(len(file_lines) - snippet_len + 1):
+    num_windows = len(file_lines) - snippet_len + 1
+    if num_windows <= 0:
+        return 1
 
-        window = file_lines[i : i + snippet_len]
-        norm_window = normalize_lines(window)
+    # Pre-normalize each file line once to avoid redundant work per window.
+    norm_file_lines = [_WHITESPACE_RE.sub("", line) for line in file_lines]
 
-        score = difflib.SequenceMatcher(None, norm_window, norm_snippet).ratio()
-        if score >= threshold:
+    matcher = difflib.SequenceMatcher(None, "", norm_snippet)
+    for i in range(num_windows):
+        norm_window = "".join(norm_file_lines[i : i + snippet_len])
+        matcher.set_seq1(norm_window)
+        if matcher.quick_ratio() >= threshold and matcher.ratio() >= threshold:
             return i + 1
 
     return 1

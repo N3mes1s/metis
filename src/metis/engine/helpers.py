@@ -10,13 +10,19 @@ from langchain_core.prompts import ChatPromptTemplate
 logger = logging.getLogger("metis")
 
 
-def summarize_changes(llm_provider, file_path, issues, summary_prompt):
+def build_summary_chain(llm_provider):
+    """Build and return a reusable summarization chain."""
+    chat = llm_provider.get_chat_model()
+    prompt_tmpl = ChatPromptTemplate.from_messages(
+        [("system", "{system}"), ("user", "{input}")]
+    )
+    return prompt_tmpl | chat | StrOutputParser()
+
+
+def summarize_changes(llm_provider, file_path, issues, summary_prompt, *, chain=None):
     try:
-        chat = llm_provider.get_chat_model()
-        prompt_tmpl = ChatPromptTemplate.from_messages(
-            [("system", "{system}"), ("user", "{input}")]
-        )
-        chain = prompt_tmpl | chat | StrOutputParser()
+        if chain is None:
+            chain = build_summary_chain(llm_provider)
         return chain.invoke(
             {"system": summary_prompt or "", "input": issues or ""}
         ).strip()

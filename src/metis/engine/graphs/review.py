@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import threading
 from functools import partial
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -10,7 +11,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.cache.memory import InMemoryCache
 
 from metis.utils import split_snippet, parse_json_output, enrich_issues
-from .schemas import ReviewResponseModel, review_schema_prompt
+from .schemas import ReviewResponseModel, BatchReviewResponseModel, review_schema_prompt
 from .utils import (
     retrieve_text,
     synthesize_context,
@@ -21,6 +22,21 @@ from .types import ReviewRequest, ReviewState
 
 
 logger = logging.getLogger("metis")
+
+
+def _bind_structured_output(chat_model, response_model):
+    """Try binding structured output via function_calling, then json_schema.
+
+    Returns the bound model or ``None`` if neither method succeeds.
+    """
+    for method in ("function_calling", "json_schema"):
+        try:
+            bound = chat_model.with_structured_output(response_model, method=method)
+            logger.info("Structured output bound with method=%s", method)
+            return bound
+        except Exception as exc:
+            logger.warning("Structured output method=%s failed: %s", method, exc)
+    return None
 
 
 def _normalize_reviews(raw) -> list[dict]:
@@ -100,6 +116,10 @@ def _post_process_reviews(
 
 
 def review_node_retrieve(state: ReviewState) -> ReviewState:
+    if state.get("skip_retrieval"):
+        new_state: ReviewState = dict(state)
+        new_state["context"] = ""
+        return new_state
     cp = state.get("context_prompt", "")
     code = retrieve_text(state["retriever_code"], cp)
     docs = retrieve_text(state["retriever_docs"], cp)
@@ -203,6 +223,12 @@ class ReviewGraph:
                 "Unable to create review runnable; OpenAI-based provider required."
             )
         self._app_cache = {}
+        self._app_cache_lock = threading.Lock()
+        # Lazily built batch runnables (created on first review_batch call)
+        self._batch_structured_node = None
+        self._batch_fallback_node = None
+        self._batch_runnables_ready = False
+        self._batch_init_lock = threading.Lock()
 
     def _create_structured_review_runnable(self):
         get_chat_model = getattr(self.llm_provider, "get_chat_model", None)
@@ -219,16 +245,30 @@ class ReviewGraph:
             [("system", "{system_prompt}"), ("user", "{body_text}")]
         )
         self._fallback_review_node = prompt | chat_model | StrOutputParser()
+
+        structured_model = _bind_structured_output(chat_model, ReviewResponseModel)
+        if structured_model is not None:
+            return prompt | structured_model
+        return None
+
+    def _init_batch_runnables(self):
+        """Build and cache the batch-review runnables (once)."""
+        self._batch_runnables_ready = True
+        get_chat_model = getattr(self.llm_provider, "get_chat_model", None)
+        if not callable(get_chat_model):
+            return
         try:
-            structured_model = chat_model.with_structured_output(
-                ReviewResponseModel, method="function_calling"
-            )
+            chat_model = get_chat_model(model=self.llama_query_model)
         except Exception as exc:
-            logger.warning(
-                "Failed to bind structured output schema for review graph: %s", exc
-            )
-            return None
-        return prompt | structured_model
+            logger.warning("Unable to create chat model for batch review: %s", exc)
+            return
+        prompt = ChatPromptTemplate.from_messages(
+            [("system", "{system_prompt}"), ("user", "{body_text}")]
+        )
+        self._batch_fallback_node = prompt | chat_model | StrOutputParser()
+        structured_model = _bind_structured_output(chat_model, BatchReviewResponseModel)
+        if structured_model is not None:
+            self._batch_structured_node = prompt | structured_model
 
     def _build_app(self, language_prompts, default_prompt_key):
         cache_key = (id(language_prompts), default_prompt_key)
@@ -236,6 +276,14 @@ class ReviewGraph:
         if cached is not None:
             return cached
 
+        with self._app_cache_lock:
+            # Double-check after acquiring the lock.
+            cached = self._app_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            return self._compile_app(language_prompts, default_prompt_key, cache_key)
+
+    def _compile_app(self, language_prompts, default_prompt_key, cache_key):
         graph = StateGraph(ReviewState)
         retrieve = review_node_retrieve
         build_prompt = partial(
@@ -281,6 +329,8 @@ class ReviewGraph:
         mode = request.get("mode", "file")
         original_file = request.get("original_file")
 
+        skip_retrieval = request.get("skip_retrieval", False)
+
         chunks = split_snippet(snippet, self.max_token_length)
         accumulated = []
         app = self._build_app(language_prompts, default_prompt_key)
@@ -294,6 +344,7 @@ class ReviewGraph:
                 "relative_file": relative_file,
                 "mode": mode,
                 "original_file": original_file,
+                "skip_retrieval": skip_retrieval,
             }
             out = app.invoke(state)
             chunk_reviews = out.get("parsed_reviews", []) or []
@@ -317,3 +368,98 @@ class ReviewGraph:
         }
 
         return result
+
+    def review_batch(self, file_entries, language_prompts, default_prompt_key="security_review_file"):
+        """
+        Review multiple small files in a single LLM call.
+        file_entries: list of dicts with keys 'file_path', 'relative_file', 'snippet'.
+        Returns list of per-file result dicts.
+        """
+        # Build the batch body with file delimiters
+        sections = []
+        for entry in file_entries:
+            fp = entry.get("relative_file") or entry["file_path"]
+            sections.append(f"=== FILE: {fp} ===")
+            sections.append(entry["snippet"])
+            sections.append("")
+        batch_body = "\n".join(sections)
+
+        # Build system prompt (reuse existing logic)
+        system_prompt = build_review_system_prompt(
+            language_prompts,
+            default_prompt_key,
+            self.report_prompt,
+            self.custom_prompt_text,
+            self.custom_guidance_precedence,
+            self._schema_prompt_section,
+        )
+
+        payload = {"system_prompt": system_prompt, "body_text": batch_body}
+
+        # Lazily build & cache the batch runnables once.
+        if not self._batch_runnables_ready:
+            with self._batch_init_lock:
+                if not self._batch_runnables_ready:
+                    self._init_batch_runnables()
+
+        # Try structured output first with BatchReviewResponseModel
+        raw = None
+        try:
+            if self._batch_structured_node is not None:
+                try:
+                    raw = self._batch_structured_node.invoke(payload)
+                except Exception as exc:
+                    logger.warning("Batch structured output failed: %s", exc)
+            if raw is None and self._batch_fallback_node is not None:
+                try:
+                    raw = self._batch_fallback_node.invoke(payload)
+                except Exception as exc2:
+                    logger.error("Batch fallback also failed: %s", exc2)
+                    return None
+        except Exception as exc:
+            logger.error("Batch review failed: %s", exc)
+            return None
+
+        # Parse results
+        if isinstance(raw, BatchReviewResponseModel):
+            batch_data = raw.model_dump()
+        elif isinstance(raw, dict):
+            batch_data = raw
+        elif isinstance(raw, str):
+            parsed = parse_json_output(raw)
+            if isinstance(parsed, dict):
+                batch_data = parsed
+            else:
+                logger.warning("Could not parse batch response as JSON")
+                return None
+        else:
+            logger.warning("Unexpected batch response type: %s", type(raw).__name__)
+            return None
+
+        # Map results back to per-file dicts
+        file_map = {}
+        for f_result in batch_data.get("files", []):
+            fp = f_result.get("file_path", "")
+            reviews = f_result.get("reviews", [])
+            # Normalize reviews
+            normalized = []
+            for r in reviews:
+                if isinstance(r, dict):
+                    normalized.append(r)
+            file_map[fp] = normalized
+
+        results = []
+        for entry in file_entries:
+            rel = entry.get("relative_file") or entry["file_path"]
+            reviews = file_map.get(rel, [])
+            # Post-process reviews
+            try:
+                reviews = _post_process_reviews(reviews, entry["file_path"])
+            except Exception:
+                pass
+            results.append({
+                "file": rel,
+                "file_path": entry["file_path"],
+                "reviews": reviews,
+            })
+        return results

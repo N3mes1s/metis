@@ -74,7 +74,7 @@ class PGVectorStoreImpl(BaseVectorStore):
 
         except Exception as e:
             logger.error(f"Error initializing PGVectorStore: {e}")
-            raise VectorStoreInitError()
+            raise VectorStoreInitError() from e
 
     def get_query_engines(self, llm_provider, similarity_top_k, response_mode):
         try:
@@ -85,23 +85,22 @@ class PGVectorStoreImpl(BaseVectorStore):
                 self.vector_store_docs, storage_context=self.storage_context_docs
             )
 
-            llm_code = self._build_llm(llm_provider)
-            llm_docs = self._build_llm(llm_provider)
+            llm = self._build_llm(llm_provider)
 
             qe_code = index_code.as_query_engine(
-                llm=llm_code,
+                llm=llm,
                 similarity_top_k=similarity_top_k,
                 response_mode=response_mode,
             )
             qe_docs = index_docs.as_query_engine(
-                llm=llm_docs,
+                llm=llm,
                 similarity_top_k=similarity_top_k,
                 response_mode=response_mode,
             )
             return (QueryEngineRetriever(qe_code), QueryEngineRetriever(qe_docs))
         except Exception as e:
             logger.error(f"Error creating PG query engines: {e}")
-            raise QueryEngineInitError()
+            raise QueryEngineInitError() from e
 
     def get_storage_contexts(self):
         return self.storage_context_code, self.storage_context_docs
@@ -126,6 +125,6 @@ class PGVectorStoreImpl(BaseVectorStore):
                         f"Project schema '{self.project_schema}' does not exist in the database."
                     )
                 return exists
-        except Exception:
+        except Exception as e:
             logger.error(f"Error checking for project schema '{self.project_schema}'")
-            raise VectorSchemaError()
+            raise VectorSchemaError() from e

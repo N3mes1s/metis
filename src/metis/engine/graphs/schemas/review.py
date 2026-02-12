@@ -66,6 +66,25 @@ class ReviewResponseModel(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class BatchFileReviewModel(BaseModel):
+    file_path: str = Field(description="Relative path of the reviewed file")
+    reviews: list[ReviewIssueModel] = Field(
+        default_factory=list,
+        description="Security review findings for this file",
+    )
+
+    model_config = ConfigDict(extra="allow")
+
+
+class BatchReviewResponseModel(BaseModel):
+    files: list[BatchFileReviewModel] = Field(
+        default_factory=list,
+        description="Per-file security review results for a batch of files",
+    )
+
+    model_config = ConfigDict(extra="allow")
+
+
 def review_schema_json():
     """Return the JSON schema derived from the Pydantic response model."""
     return ReviewResponseModel.model_json_schema()
